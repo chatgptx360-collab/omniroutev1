@@ -272,6 +272,45 @@ async function stopApp(child) {
   }
 }
 
+// Splits "C:\\path\\to\\profile" into { drive: "C:", path: "\\path\\to\\profile" }.
+// Returns null for anything without a drive letter (e.g. a UNC path), in which
+// case HOMEDRIVE/HOMEPATH are simply left unset.
+export function parseWin32Path(absolutePath) {
+  const match = /^([A-Za-z]:)([\\/].*)$/.exec(absolutePath ?? "");
+  if (!match) return null;
+  return { drive: match[1], path: match[2].replace(/\//g, "\\") };
+}
+
+// Machine-scoped Windows variables that Chromium/Electron expect to exist.
+// Deliberately excludes every user-directory variable (USERPROFILE, APPDATA,
+// LOCALAPPDATA, TEMP, TMP) -- those are redirected into the smoke sandbox -- and
+// every credential-bearing variable, so secrets still cannot leak into the
+// child process.
+export const WINDOWS_MACHINE_ENV_NAMES = [
+  "ALLUSERSPROFILE",
+  "CommonProgramFiles",
+  "CommonProgramFiles(x86)",
+  "CommonProgramW6432",
+  "COMPUTERNAME",
+  "DriverData",
+  "NUMBER_OF_PROCESSORS",
+  "OS",
+  "PROCESSOR_ARCHITECTURE",
+  "PROCESSOR_ARCHITEW6432",
+  "PROCESSOR_IDENTIFIER",
+  "PROCESSOR_LEVEL",
+  "PROCESSOR_REVISION",
+  "ProgramData",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "ProgramW6432",
+  "PUBLIC",
+  "SESSIONNAME",
+  "SystemDrive",
+  "USERDOMAIN",
+  "USERNAME",
+];
+
 export function buildSmokeEnv({
   dataDir,
   parentEnv = process.env,
@@ -300,6 +339,15 @@ export function buildSmokeEnv({
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
     "ELECTRON_OZONE_PLATFORM_HINT",
+    // Windows machine-level variables. Chromium needs a substantially more
+    // complete environment on Windows than the POSIX list above provides: with
+    // only PATH/SystemRoot/COMSPEC the packaged app aborts during startup and
+    // exits 0 before Electron logs anything, which reads exactly like the
+    // requestSingleInstanceLock() bail-out in electron/main.js. None of these
+    // are secrets, and none of them are user-directory variables -- USERPROFILE,
+    // APPDATA, LOCALAPPDATA, TEMP and TMP are still redirected into the sandbox
+    // below, so the isolation guarantee is unchanged.
+    ...WINDOWS_MACHINE_ENV_NAMES,
   ];
   const smokeEnv = {};
 
@@ -315,6 +363,14 @@ export function buildSmokeEnv({
     smokeEnv.LOCALAPPDATA = join(dataDir, "AppData", "Local");
     smokeEnv.TEMP ||= join(dataDir, "tmp");
     smokeEnv.TMP ||= smokeEnv.TEMP;
+    // Derived from the sandboxed profile rather than inherited, so Windows APIs
+    // that resolve the home directory through HOMEDRIVE + HOMEPATH land inside
+    // the sandbox too instead of the real user profile.
+    const parsedProfile = parseWin32Path(smokeEnv.USERPROFILE);
+    if (parsedProfile) {
+      smokeEnv.HOMEDRIVE = parsedProfile.drive;
+      smokeEnv.HOMEPATH = parsedProfile.path;
+    }
   } else {
     smokeEnv.HOME = join(dataDir, "home");
     smokeEnv.XDG_CONFIG_HOME = join(dataDir, "config");
