@@ -92,9 +92,14 @@ jobs:
         working-directory: electron
         run: npm install --no-audit --no-fund
 
+      # `--publish never` is required: electron/package.json carries a `publish`
+      # block pointing at the upstream GitHub repo, and electron-builder turns
+      # that into an implicit publish as soon as it detects CI. Both binaries
+      # build fine, then the run dies with "GitHub Personal Access Token is not
+      # set". We want artifacts, not a release, so publishing is disabled.
       - name: Build Windows installer and portable executable
         working-directory: electron
-        run: npm run build:win
+        run: npm run build:win -- --publish never
 
       # Restore the real profile so Electron's single-instance lock works.
       - name: Restore Windows home directory
@@ -123,8 +128,10 @@ jobs:
           for file in *.exe; do
             [ -f "$file" ] || continue
             case "$file" in
-              *Setup*) cp "$file" ../../out/installer/ ;;
-              *)       cp "$file" "../../out/portable/OmniRoute.exe" ;;
+              # NSIS leaves a transient uninstaller stub behind; never ship it.
+              *__uninstaller*) continue ;;
+              *Setup*)         cp "$file" ../../out/installer/ ;;
+              *)               cp "$file" "../../out/portable/OmniRoute.exe" ;;
             esac
           done
           # electron-updater manifest travels with the installer.
