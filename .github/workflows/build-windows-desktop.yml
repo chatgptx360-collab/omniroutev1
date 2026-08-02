@@ -1,0 +1,155 @@
+name: Build Windows Desktop App
+
+# Builds the OmniRoute Windows desktop application from the existing Electron
+# implementation in electron/ and publishes both distributables as downloadable
+# GitHub Actions artifacts:
+#
+#   * OmniRoute-Windows-Installer  → NSIS installer  (OmniRoute Setup <version>.exe)
+#   * OmniRoute-Windows-Portable   → portable binary (OmniRoute.exe)
+#
+# Unlike .github/workflows/electron-release.yml, the packaged smoke test here is
+# a BLOCKING gate: if the packaged app cannot boot its backend and serve the UI,
+# this workflow fails and no artifact is published.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/omniroute-windows-desktop-40i9g7
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows (NSIS + portable)
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      # The default Windows USERPROFILE contains junction points ("Application
+      # Data") that make the Next.js standalone build's glob scan die with EPERM.
+      # Upstream works around this by repointing USERPROFILE at a clean temp dir.
+      #
+      # That workaround is why upstream marks the Windows smoke step
+      # continue-on-error: with a synthetic USERPROFILE still in effect,
+      # Electron's requestSingleInstanceLock() fails and the packaged app exits
+      # before it can serve anything. We therefore stash the real profile path
+      # here and restore it after packaging, so the smoke test runs against a
+      # normal Windows profile and can be a genuine blocking gate.
+      - name: Sanitize Windows home directory (build only)
+        shell: bash
+        run: |
+          echo "ORIGINAL_USERPROFILE=$USERPROFILE" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "USERPROFILE=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+
+      - name: Build Next.js standalone
+        env:
+          JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+          NODE_OPTIONS: "--max_old_space_size=6144"
+          OMNIROUTE_USE_TURBOPACK: "1"
+        run: npm run build
+
+      # Keep electron/package.json in lockstep with the root package.json so the
+      # installer filename and the in-app version agree.
+      - name: Sync version into electron/package.json
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const root = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const pkgPath = 'electron/package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = root.version;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+            console.log('electron/package.json version set to ' + root.version);
+          "
+
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm install --no-audit --no-fund
+
+      - name: Build Windows installer and portable executable
+        working-directory: electron
+        run: npm run build:win
+
+      # Restore the real profile so Electron's single-instance lock works.
+      - name: Restore Windows home directory
+        shell: bash
+        run: echo "USERPROFILE=$ORIGINAL_USERPROFILE" >> "$GITHUB_ENV"
+
+      - name: List build output
+        shell: bash
+        run: ls -la electron/dist-electron/
+
+      # BLOCKING. Launches the packaged binary with an isolated APPDATA, waits
+      # for the bundled backend to answer http://127.0.0.1:20128/login with 200,
+      # scans stdout/stderr for fatal loader errors (MODULE_NOT_FOUND,
+      # ERR_DLOPEN_FAILED, ...), then verifies a clean shutdown.
+      - name: Smoke test packaged app (blocking)
+        env:
+          ELECTRON_SMOKE_TIMEOUT_MS: 120000
+          ELECTRON_SMOKE_STREAM_LOGS: "1"
+        run: npm run electron:smoke:packaged
+
+      - name: Stage distributables
+        shell: bash
+        run: |
+          mkdir -p out/installer out/portable
+          cd electron/dist-electron
+          for file in *.exe; do
+            [ -f "$file" ] || continue
+            case "$file" in
+              *Setup*) cp "$file" ../../out/installer/ ;;
+              *)       cp "$file" "../../out/portable/OmniRoute.exe" ;;
+            esac
+          done
+          # electron-updater manifest travels with the installer.
+          for file in latest*.yml; do
+            [ -f "$file" ] && cp "$file" ../../out/installer/
+          done
+          cd ../..
+          echo "--- installer ---" && ls -la out/installer/
+          echo "--- portable ---"  && ls -la out/portable/
+          # Fail loudly rather than uploading an empty artifact.
+          [ -n "$(ls -A out/installer/*.exe 2>/dev/null)" ] || { echo "::error::NSIS installer missing"; exit 1; }
+          [ -f out/portable/OmniRoute.exe ] || { echo "::error::portable executable missing"; exit 1; }
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniRoute-Windows-Installer
+          path: out/installer/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload portable executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniRoute-Windows-Portable
+          path: out/portable/OmniRoute.exe
+          if-no-files-found: error
+          retention-days: 30
