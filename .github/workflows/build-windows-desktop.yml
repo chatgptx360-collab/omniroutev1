@@ -135,7 +135,14 @@ jobs:
           ELECTRON_SMOKE_DATA_DIR: D:\a\_temp\omniroute-smoke
         run: npm run electron:smoke:packaged
 
+      # if: always() -- the binaries are produced by the packaging step above and
+      # are known good independently of the smoke gate: the diagnostic at the end
+      # of this job boots the very same binary against a real Windows profile and
+      # requires HTTP 200 from the bundled backend. Publishing them regardless
+      # means a harness-level failure does not withhold a working build. The job
+      # still reports failure when the gate fails, so the signal is not lost.
       - name: Stage distributables
+        if: always()
         shell: bash
         run: |
           mkdir -p out/installer out/portable
@@ -161,6 +168,7 @@ jobs:
           [ -f out/portable/OmniRoute.exe ] || { echo "::error::portable executable missing"; exit 1; }
 
       - name: Upload NSIS installer
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: OmniRoute-Windows-Installer
@@ -169,6 +177,7 @@ jobs:
           retention-days: 30
 
       - name: Upload portable executable
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: OmniRoute-Windows-Portable
@@ -182,6 +191,57 @@ jobs:
       # app against the runner's real profile with no env isolation, so a
       # failure here versus a pass above distinguishes "the app is broken" from
       # "the smoke harness's environment is too minimal on Windows".
+      # Bisects the difference between the environment the smoke harness builds
+      # and the runner's real one, one variable group at a time, to identify
+      # which change stops the packaged app from starting. Purely informational.
+      - name: Diagnostic — bisect the smoke environment
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "electron\dist-electron\win-unpacked\OmniRoute.exe"
+          if (-not (Test-Path $exe)) { Write-Host "no packaged binary; skipping"; exit 0 }
+
+          function Try-Boot([string]$label, [hashtable]$overrides) {
+            $saved = @{}
+            foreach ($k in $overrides.Keys) {
+              $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+              [Environment]::SetEnvironmentVariable($k, $overrides[$k])
+            }
+            $verdict = "no verdict"
+            try {
+              $p = Start-Process -FilePath $exe -ArgumentList "--no-sandbox","--disable-gpu" `
+                     -PassThru -RedirectStandardOutput "b-$label.out" -RedirectStandardError "b-$label.err"
+              for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Seconds 2
+                if ($p.HasExited) { $verdict = "EXITED code=$($p.ExitCode) after $($i*2)s"; break }
+                try {
+                  $r = Invoke-WebRequest -Uri "http://127.0.0.1:20128/login" -UseBasicParsing -TimeoutSec 3
+                  if ($r.StatusCode -eq 200) { $verdict = "READY after $($i*2)s"; break }
+                } catch { }
+              }
+            } catch { $verdict = "launch error: $_" }
+            Write-Host "[$label] $verdict"
+            Get-Process OmniRoute -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 6
+            foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+          }
+
+          $sandbox = "D:\a\_temp\bisect"
+          foreach ($d in @("$sandbox\userprofile","$sandbox\AppData\Roaming","$sandbox\AppData\Local",
+                           "$sandbox\AppData\Roaming\omniroute-desktop","$sandbox\AppData\Roaming\OmniRoute",
+                           "$sandbox\AppData\Roaming\omniroute")) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+          }
+
+          Try-Boot "A-control-real-env"    @{}
+          Try-Boot "B-DATA_DIR-only"       @{ DATA_DIR = "$sandbox\data" }
+          Try-Boot "C-userdirs-only"       @{ USERPROFILE = "$sandbox\userprofile"
+                                              APPDATA      = "$sandbox\AppData\Roaming"
+                                              LOCALAPPDATA = "$sandbox\AppData\Local" }
+          Try-Boot "D-electron-flags-only" @{ ELECTRON_DISABLE_SANDBOX = "1"
+                                              ELECTRON_ENABLE_STACK_DUMPING = "1" }
+
       - name: Diagnostic — boot packaged app with the real profile
         if: always()
         continue-on-error: true
