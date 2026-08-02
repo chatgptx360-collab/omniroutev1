@@ -114,47 +114,20 @@ jobs:
       # for the bundled backend to answer http://127.0.0.1:20128/login with 200,
       # scans stdout/stderr for fatal loader errors (MODULE_NOT_FOUND,
       # ERR_DLOPEN_FAILED, ...), then verifies a clean shutdown.
-      # Diagnostic only — never blocks. Boots the packaged app against the
-      # runner's real profile (no env isolation at all). If this reaches the UI
-      # but the isolated smoke below does not, the fault is in the smoke
-      # harness's environment, not in the packaged application.
-      - name: Diagnostic — boot packaged app with the real profile
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $exe = "electron\dist-electron\win-unpacked\OmniRoute.exe"
-          Write-Host "APPDATA=$env:APPDATA"
-          Write-Host "USERPROFILE=$env:USERPROFILE"
-          Write-Host "TEMP=$env:TEMP"
-          $env:ELECTRON_ENABLE_LOGGING = "1"
-          $p = Start-Process -FilePath $exe -ArgumentList "--no-sandbox","--disable-gpu" `
-                 -PassThru -RedirectStandardOutput diag-out.log -RedirectStandardError diag-err.log
-          for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep -Seconds 2
-            if ($p.HasExited) { Write-Host "RESULT: app exited early code=$($p.ExitCode) after $($i*2)s"; break }
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:20128/login" -UseBasicParsing -TimeoutSec 3
-              if ($r.StatusCode -eq 200) { Write-Host "RESULT: app READY after $($i*2)s"; break }
-            } catch { }
-          }
-          Write-Host "--- stdout ---"; if (Test-Path diag-out.log) { Get-Content diag-out.log }
-          Write-Host "--- stderr ---"; if (Test-Path diag-err.log) { Get-Content diag-err.log }
-          Get-Process OmniRoute -ErrorAction SilentlyContinue | Stop-Process -Force
-          Start-Sleep -Seconds 8
-          Write-Host "port 20128 listeners after cleanup:"
-          (Get-NetTCPConnection -LocalPort 20128 -ErrorAction SilentlyContinue | Measure-Object).Count
-
-      # BLOCKING. Launches the packaged binary with an isolated APPDATA, waits
-      # for the bundled backend to answer http://127.0.0.1:20128/login with 200,
-      # scans stdout/stderr for fatal loader errors (MODULE_NOT_FOUND,
-      # ERR_DLOPEN_FAILED, ...), then verifies a clean shutdown.
       #
       # ELECTRON_SMOKE_DATA_DIR is pinned to a clean long path. Left to itself
       # the harness builds its sandbox under tmpdir(), which on this runner is
       # C:\Users\RUNNER~1\AppData\Local\Temp -- an 8.3 short path. Chromium's
-      # ProcessSingleton keys its lock on the user-data directory, and the
-      # short-name form is what makes requestSingleInstanceLock() fail, so
-      # main.js takes its process.exit(0) branch before serving anything.
+      # ProcessSingleton keys its lock on the user-data directory, so the
+      # short-name form is a candidate cause of requestSingleInstanceLock()
+      # failing, which sends main.js down its process.exit(0) branch at line 42
+      # before anything is served. That is the observed symptom: the app exits
+      # with code 0 roughly half a second after launch.
+      #
+      # This has not been isolated yet. Run 30769380671 failed with the short
+      # path and no interference; run 30770188286 failed with the long path but
+      # had a stray diagnostic process still holding port 20128. This run is the
+      # first clean test of the long path on its own.
       - name: Smoke test packaged app (blocking)
         env:
           ELECTRON_SMOKE_TIMEOUT_MS: 120000
@@ -202,3 +175,31 @@ jobs:
           path: out/portable/OmniRoute.exe
           if-no-files-found: error
           retention-days: 30
+
+      # Diagnostic only — never blocks, and deliberately runs AFTER the gate so
+      # it cannot leave a process on port 20128 for the smoke test to trip over
+      # (which is exactly what happened in run 30770188286). Boots the packaged
+      # app against the runner's real profile with no env isolation, so a
+      # failure here versus a pass above distinguishes "the app is broken" from
+      # "the smoke harness's environment is too minimal on Windows".
+      - name: Diagnostic — boot packaged app with the real profile
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "electron\dist-electron\win-unpacked\OmniRoute.exe"
+          if (-not (Test-Path $exe)) { Write-Host "no packaged binary; skipping"; exit 0 }
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $p = Start-Process -FilePath $exe -ArgumentList "--no-sandbox","--disable-gpu" `
+                 -PassThru -RedirectStandardOutput diag-out.log -RedirectStandardError diag-err.log
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+            if ($p.HasExited) { Write-Host "RESULT: app exited early code=$($p.ExitCode) after $($i*2)s"; break }
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:20128/login" -UseBasicParsing -TimeoutSec 3
+              if ($r.StatusCode -eq 200) { Write-Host "RESULT: app READY after $($i*2)s"; break }
+            } catch { }
+          }
+          Write-Host "--- stderr tail ---"
+          if (Test-Path diag-err.log) { Get-Content diag-err.log -Tail 25 }
+          Get-Process OmniRoute -ErrorAction SilentlyContinue | Stop-Process -Force
