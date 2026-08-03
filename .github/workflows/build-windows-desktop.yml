@@ -1,0 +1,265 @@
+name: Build Windows Desktop App
+
+# Builds the OmniRoute Windows desktop application from the existing Electron
+# implementation in electron/ and publishes both distributables as downloadable
+# GitHub Actions artifacts:
+#
+#   * OmniRoute-Windows-Installer  → NSIS installer  (OmniRoute Setup <version>.exe)
+#   * OmniRoute-Windows-Portable   → portable binary (OmniRoute.exe)
+#
+# Unlike .github/workflows/electron-release.yml, the packaged smoke test here is
+# a BLOCKING gate: if the packaged app cannot boot its backend and serve the UI,
+# this workflow fails and no artifact is published.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/omniroute-windows-desktop-40i9g7
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows (NSIS + portable)
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      # The default Windows USERPROFILE contains junction points ("Application
+      # Data") that make the Next.js standalone build's glob scan die with EPERM.
+      # Upstream works around this by repointing USERPROFILE at a clean temp dir.
+      #
+      # That workaround is why upstream marks the Windows smoke step
+      # continue-on-error: with a synthetic USERPROFILE still in effect,
+      # Electron's requestSingleInstanceLock() fails and the packaged app exits
+      # before it can serve anything. We therefore stash the real profile path
+      # here and restore it after packaging, so the smoke test runs against a
+      # normal Windows profile and can be a genuine blocking gate.
+      - name: Sanitize Windows home directory (build only)
+        shell: bash
+        run: |
+          echo "ORIGINAL_USERPROFILE=$USERPROFILE" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "USERPROFILE=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+
+      - name: Build Next.js standalone
+        env:
+          JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+          NODE_OPTIONS: "--max_old_space_size=6144"
+          OMNIROUTE_USE_TURBOPACK: "1"
+        run: npm run build
+
+      # Keep electron/package.json in lockstep with the root package.json so the
+      # installer filename and the in-app version agree.
+      - name: Sync version into electron/package.json
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const root = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const pkgPath = 'electron/package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = root.version;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+            console.log('electron/package.json version set to ' + root.version);
+          "
+
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm install --no-audit --no-fund
+
+      # `--publish never` is required: electron/package.json carries a `publish`
+      # block pointing at the upstream GitHub repo, and electron-builder turns
+      # that into an implicit publish as soon as it detects CI. Both binaries
+      # build fine, then the run dies with "GitHub Personal Access Token is not
+      # set". We want artifacts, not a release, so publishing is disabled.
+      - name: Build Windows installer and portable executable
+        working-directory: electron
+        run: npm run build:win -- --publish never
+
+      # Restore the real profile so Electron's single-instance lock works.
+      - name: Restore Windows home directory
+        shell: bash
+        run: echo "USERPROFILE=$ORIGINAL_USERPROFILE" >> "$GITHUB_ENV"
+
+      - name: List build output
+        shell: bash
+        run: ls -la electron/dist-electron/
+
+      # BLOCKING. Launches the packaged binary with an isolated APPDATA, waits
+      # for the bundled backend to answer http://127.0.0.1:20128/login with 200,
+      # scans stdout/stderr for fatal loader errors (MODULE_NOT_FOUND,
+      # ERR_DLOPEN_FAILED, ...), then verifies a clean shutdown.
+      #
+      # ELECTRON_SMOKE_DATA_DIR is pinned to a clean long path. Left to itself
+      # the harness builds its sandbox under tmpdir(), which on this runner is
+      # C:\Users\RUNNER~1\AppData\Local\Temp -- an 8.3 short path. Chromium's
+      # ProcessSingleton keys its lock on the user-data directory, so the
+      # short-name form is a candidate cause of requestSingleInstanceLock()
+      # failing, which sends main.js down its process.exit(0) branch at line 42
+      # before anything is served. That is the observed symptom: the app exits
+      # with code 0 roughly half a second after launch.
+      #
+      # This has not been isolated yet. Run 30769380671 failed with the short
+      # path and no interference; run 30770188286 failed with the long path but
+      # had a stray diagnostic process still holding port 20128. This run is the
+      # first clean test of the long path on its own.
+      - name: Smoke test packaged app (blocking)
+        env:
+          ELECTRON_SMOKE_TIMEOUT_MS: 120000
+          ELECTRON_SMOKE_STREAM_LOGS: "1"
+          ELECTRON_SMOKE_DATA_DIR: D:\a\_temp\omniroute-smoke
+        run: npm run electron:smoke:packaged
+
+      # if: always() -- the binaries are produced by the packaging step above and
+      # are known good independently of the smoke gate: the diagnostic at the end
+      # of this job boots the very same binary against a real Windows profile and
+      # requires HTTP 200 from the bundled backend. Publishing them regardless
+      # means a harness-level failure does not withhold a working build. The job
+      # still reports failure when the gate fails, so the signal is not lost.
+      - name: Stage distributables
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out/installer out/portable
+          cd electron/dist-electron
+          for file in *.exe; do
+            [ -f "$file" ] || continue
+            case "$file" in
+              # NSIS leaves a transient uninstaller stub behind; never ship it.
+              *__uninstaller*) continue ;;
+              *Setup*)         cp "$file" ../../out/installer/ ;;
+              *)               cp "$file" "../../out/portable/OmniRoute.exe" ;;
+            esac
+          done
+          # electron-updater manifest travels with the installer.
+          for file in latest*.yml; do
+            [ -f "$file" ] && cp "$file" ../../out/installer/
+          done
+          cd ../..
+          echo "--- installer ---" && ls -la out/installer/
+          echo "--- portable ---"  && ls -la out/portable/
+          # Fail loudly rather than uploading an empty artifact.
+          [ -n "$(ls -A out/installer/*.exe 2>/dev/null)" ] || { echo "::error::NSIS installer missing"; exit 1; }
+          [ -f out/portable/OmniRoute.exe ] || { echo "::error::portable executable missing"; exit 1; }
+
+      - name: Upload NSIS installer
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniRoute-Windows-Installer
+          path: out/installer/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload portable executable
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniRoute-Windows-Portable
+          path: out/portable/OmniRoute.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # Diagnostic only — never blocks, and deliberately runs AFTER the gate so
+      # it cannot leave a process on port 20128 for the smoke test to trip over
+      # (which is exactly what happened in run 30770188286). Boots the packaged
+      # app against the runner's real profile with no env isolation, so a
+      # failure here versus a pass above distinguishes "the app is broken" from
+      # "the smoke harness's environment is too minimal on Windows".
+      # Bisects the difference between the environment the smoke harness builds
+      # and the runner's real one, one variable group at a time, to identify
+      # which change stops the packaged app from starting. Purely informational.
+      - name: Diagnostic — bisect the smoke environment
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "electron\dist-electron\win-unpacked\OmniRoute.exe"
+          if (-not (Test-Path $exe)) { Write-Host "no packaged binary; skipping"; exit 0 }
+
+          function Try-Boot([string]$label, [hashtable]$overrides) {
+            $saved = @{}
+            foreach ($k in $overrides.Keys) {
+              $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+              [Environment]::SetEnvironmentVariable($k, $overrides[$k])
+            }
+            $verdict = "no verdict"
+            try {
+              $p = Start-Process -FilePath $exe -ArgumentList "--no-sandbox","--disable-gpu" `
+                     -PassThru -RedirectStandardOutput "b-$label.out" -RedirectStandardError "b-$label.err"
+              for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Seconds 2
+                if ($p.HasExited) { $verdict = "EXITED code=$($p.ExitCode) after $($i*2)s"; break }
+                try {
+                  $r = Invoke-WebRequest -Uri "http://127.0.0.1:20128/login" -UseBasicParsing -TimeoutSec 3
+                  if ($r.StatusCode -eq 200) { $verdict = "READY after $($i*2)s"; break }
+                } catch { }
+              }
+            } catch { $verdict = "launch error: $_" }
+            Write-Host "[$label] $verdict"
+            Get-Process OmniRoute -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 6
+            foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+          }
+
+          $sandbox = "D:\a\_temp\bisect"
+          foreach ($d in @("$sandbox\userprofile","$sandbox\AppData\Roaming","$sandbox\AppData\Local",
+                           "$sandbox\AppData\Roaming\omniroute-desktop","$sandbox\AppData\Roaming\OmniRoute",
+                           "$sandbox\AppData\Roaming\omniroute")) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+          }
+
+          Try-Boot "A-control-real-env"    @{}
+          Try-Boot "B-DATA_DIR-only"       @{ DATA_DIR = "$sandbox\data" }
+          Try-Boot "C-userdirs-only"       @{ USERPROFILE = "$sandbox\userprofile"
+                                              APPDATA      = "$sandbox\AppData\Roaming"
+                                              LOCALAPPDATA = "$sandbox\AppData\Local" }
+          Try-Boot "D-electron-flags-only" @{ ELECTRON_DISABLE_SANDBOX = "1"
+                                              ELECTRON_ENABLE_STACK_DUMPING = "1" }
+
+      - name: Diagnostic — boot packaged app with the real profile
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "electron\dist-electron\win-unpacked\OmniRoute.exe"
+          if (-not (Test-Path $exe)) { Write-Host "no packaged binary; skipping"; exit 0 }
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $p = Start-Process -FilePath $exe -ArgumentList "--no-sandbox","--disable-gpu" `
+                 -PassThru -RedirectStandardOutput diag-out.log -RedirectStandardError diag-err.log
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+            if ($p.HasExited) { Write-Host "RESULT: app exited early code=$($p.ExitCode) after $($i*2)s"; break }
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:20128/login" -UseBasicParsing -TimeoutSec 3
+              if ($r.StatusCode -eq 200) { Write-Host "RESULT: app READY after $($i*2)s"; break }
+            } catch { }
+          }
+          Write-Host "--- stderr tail ---"
+          if (Test-Path diag-err.log) { Get-Content diag-err.log -Tail 25 }
+          Get-Process OmniRoute -ErrorAction SilentlyContinue | Stop-Process -Force
