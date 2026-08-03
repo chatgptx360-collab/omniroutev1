@@ -6,6 +6,7 @@ import {
   FATAL_LOG_PATTERNS,
   LINUX_EXECUTABLE_NAMES,
   WINDOWS_MACHINE_ENV_NAMES,
+  WINDOWS_USER_DIR_ENV_NAMES,
 } from "../../scripts/dev/smoke-electron-packaged.mjs";
 
 test("electron smoke discovers the default Linux executable name", () => {
@@ -56,21 +57,22 @@ test("electron smoke env gives Windows a complete machine environment", () => {
   assert.equal(env.SystemDrive, "C:");
   assert.equal(env.NUMBER_OF_PROCESSORS, "4");
 
-  // User directories stay redirected into the sandbox. Separators are
-  // normalised because path.join() follows the host platform, so this branch
-  // yields "/" when the suite runs on Linux and "\" on a Windows runner.
-  const normalise = (value: string) => value.replace(/\//g, "\\");
-  assert.equal(normalise(env.USERPROFILE), "D:\\smoke\\userprofile");
-  assert.equal(env.HOMEDRIVE, "D:");
-  assert.equal(env.HOMEPATH, "\\smoke\\userprofile");
-  assert.ok(!normalise(env.APPDATA).startsWith("C:\\Users\\real"));
+  // Windows user directories are inherited, NOT redirected. Redirecting them
+  // stops the packaged app booting at all — it exits 0 before Electron can log
+  // anything. Measured by bisect in CI; see buildSmokeEnv's win32 branch.
+  assert.equal(env.USERPROFILE, "C:\\Users\\real");
+  assert.equal(env.APPDATA, "C:\\Users\\real\\AppData\\Roaming");
+
+  // Isolation still holds where it matters: DATA_DIR is what OmniRoute uses for
+  // the SQLite database, .env, logs and backups.
+  assert.equal(env.DATA_DIR, "D:\\smoke");
 
   // Secrets still never reach the child.
   assert.equal(env.GITHUB_TOKEN, undefined);
 });
 
 test("electron smoke inherits no credential-shaped Windows variables", () => {
-  for (const name of WINDOWS_MACHINE_ENV_NAMES) {
+  for (const name of [...WINDOWS_MACHINE_ENV_NAMES, ...WINDOWS_USER_DIR_ENV_NAMES]) {
     assert.ok(
       !/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(name),
       `${name} must not be inherited into the smoke environment`

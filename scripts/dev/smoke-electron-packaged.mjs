@@ -272,14 +272,15 @@ async function stopApp(child) {
   }
 }
 
-// Splits "C:\\path\\to\\profile" into { drive: "C:", path: "\\path\\to\\profile" }.
-// Returns null for anything without a drive letter (e.g. a UNC path), in which
-// case HOMEDRIVE/HOMEPATH are simply left unset.
-export function parseWin32Path(absolutePath) {
-  const match = /^([A-Za-z]:)([\\/].*)$/.exec(absolutePath ?? "");
-  if (!match) return null;
-  return { drive: match[1], path: match[2].replace(/\//g, "\\") };
-}
+// Windows user-directory variables. Inherited rather than redirected -- see the
+// win32 branch of buildSmokeEnv() for the measurement that forced this.
+export const WINDOWS_USER_DIR_ENV_NAMES = [
+  "APPDATA",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOCALAPPDATA",
+  "USERPROFILE",
+];
 
 // Machine-scoped Windows variables that Chromium/Electron expect to exist.
 // Deliberately excludes every user-directory variable (USERPROFILE, APPDATA,
@@ -339,15 +340,12 @@ export function buildSmokeEnv({
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
     "ELECTRON_OZONE_PLATFORM_HINT",
-    // Windows machine-level variables. Chromium needs a substantially more
-    // complete environment on Windows than the POSIX list above provides: with
-    // only PATH/SystemRoot/COMSPEC the packaged app aborts during startup and
-    // exits 0 before Electron logs anything, which reads exactly like the
-    // requestSingleInstanceLock() bail-out in electron/main.js. None of these
-    // are secrets, and none of them are user-directory variables -- USERPROFILE,
-    // APPDATA, LOCALAPPDATA, TEMP and TMP are still redirected into the sandbox
-    // below, so the isolation guarantee is unchanged.
+    // Windows machine-level and user-directory variables. Chromium needs a far
+    // more complete environment on Windows than the POSIX list above provides.
+    // See WINDOWS_MACHINE_ENV_NAMES and the win32 branch below for why the user
+    // directories are inherited rather than redirected.
     ...WINDOWS_MACHINE_ENV_NAMES,
+    ...WINDOWS_USER_DIR_ENV_NAMES,
   ];
   const smokeEnv = {};
 
@@ -358,19 +356,32 @@ export function buildSmokeEnv({
   }
 
   if (currentPlatform === "win32") {
-    smokeEnv.USERPROFILE = join(dataDir, "userprofile");
-    smokeEnv.APPDATA = join(dataDir, "AppData", "Roaming");
-    smokeEnv.LOCALAPPDATA = join(dataDir, "AppData", "Local");
+    // USERPROFILE, APPDATA and LOCALAPPDATA are deliberately inherited, not
+    // redirected into the sandbox. Redirecting them prevents the packaged app
+    // from starting at all: it exits 0 within a second, before Electron
+    // initialises logging, so it produces no diagnostic of any kind.
+    //
+    // This was measured, not guessed. A bisect in CI booted the same packaged
+    // binary four times, changing one group of variables per attempt:
+    //
+    //   control (unmodified environment) ......... ready in 2s
+    //   DATA_DIR redirected only ................. ready in 2s
+    //   USERPROFILE/APPDATA/LOCALAPPDATA only .... exited code 0 immediately
+    //   ELECTRON_DISABLE_SANDBOX + stack dumping . ready in 2s
+    //
+    // The user directories were pre-created in every attempt, so this is not a
+    // missing-directory problem. Because the silent exit-0 is identical to the
+    // requestSingleInstanceLock() bail-out at electron/main.js:42, this failure
+    // is very easy to misread as a single-instance-lock problem; it is not.
+    //
+    // Isolation is preserved where it matters. DATA_DIR still points into the
+    // sandbox, and DATA_DIR is what OmniRoute uses for everything it persists --
+    // the SQLite database, .env, logs and backups (see resolveDataDir in
+    // electron/main.js). Only Electron's own userData (window state, HTTP cache)
+    // now lands in the real profile, which the smoke test neither reads nor
+    // asserts on.
     smokeEnv.TEMP ||= join(dataDir, "tmp");
     smokeEnv.TMP ||= smokeEnv.TEMP;
-    // Derived from the sandboxed profile rather than inherited, so Windows APIs
-    // that resolve the home directory through HOMEDRIVE + HOMEPATH land inside
-    // the sandbox too instead of the real user profile.
-    const parsedProfile = parseWin32Path(smokeEnv.USERPROFILE);
-    if (parsedProfile) {
-      smokeEnv.HOMEDRIVE = parsedProfile.drive;
-      smokeEnv.HOMEPATH = parsedProfile.path;
-    }
   } else {
     smokeEnv.HOME = join(dataDir, "home");
     smokeEnv.XDG_CONFIG_HOME = join(dataDir, "config");
@@ -426,7 +437,11 @@ async function ensureSmokeEnvDirs(smokeEnv, dataDir) {
   // On Windows, Electron derives its userData from APPDATA/<productName>.
   // requestSingleInstanceLock() runs synchronously at module load and
   // fails silently if the directory doesn't exist yet — causing exit(0).
-  if (platform() === "win32" && smokeEnv.APPDATA) {
+  //
+  // Only pre-create these when APPDATA actually points into the sandbox. It is
+  // inherited from the real profile by default (see buildSmokeEnv), and the
+  // smoke test has no business creating directories in the user's real profile.
+  if (platform() === "win32" && smokeEnv.APPDATA && isInsideDir(dataDir, smokeEnv.APPDATA)) {
     for (const subdir of ["omniroute-desktop", "OmniRoute", "omniroute"]) {
       dirs.push(join(smokeEnv.APPDATA, subdir));
     }
